@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>مايك روبلوكس</title>
+<link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#172033;--panel:#1f2b45;--text:#eef2f8;--mute:#9aa8c4;--ok:#5fd6b0;--warn:#ffb020;--hot:#ff5d5d;--line:#32425f}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font-family:"Tajawal",system-ui,sans-serif;display:flex;justify-content:center;padding:env(safe-area-inset-top) 16px env(safe-area-inset-bottom)}
+main{width:100%;max-width:420px;display:flex;flex-direction:column;align-items:center;gap:18px;padding:28px 0}
+h1{font-size:1.5rem;margin:0;font-weight:800}
+p{margin:0;color:var(--mute);line-height:1.7;text-align:center}
+.hidden{display:none!important}
+input{width:100%;font:inherit;font-size:1.6rem;letter-spacing:.3em;text-align:center;text-transform:uppercase;padding:12px;border-radius:12px;border:2px solid var(--line);background:var(--panel);color:var(--text)}
+button{font:inherit;font-weight:700;font-size:1.05rem;padding:14px 22px;border:0;border-radius:12px;background:var(--warn);color:#2a1d00;cursor:pointer;width:100%}
+button:focus-visible,input:focus-visible{outline:3px solid #fff;outline-offset:2px}
+.status{display:flex;align-items:center;gap:8px;font-weight:700}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--mute)}
+.dot.on{background:var(--ok)}
+.mic{position:relative;width:120px;height:210px;border-radius:60px;background:var(--panel);border:3px solid var(--line);overflow:hidden;margin:8px 0}
+.mic .fill{position:absolute;inset:auto 0 0 0;height:0%;background:var(--ok);transition:height .08s linear,background .15s}
+.mic.off{opacity:.45}
+.state{font-size:1.15rem;font-weight:800}
+.list{width:100%;background:var(--panel);border-radius:12px;padding:12px 16px;min-height:56px}
+.list b{display:block;margin-bottom:6px;color:var(--mute);font-weight:400;font-size:.9rem}
+.list span{display:inline-block;background:var(--bg);border-radius:20px;padding:4px 12px;margin:3px 0 3px 6px}
+#msg{color:var(--warn);min-height:1.4em}
+@media (prefers-reduced-motion:reduce){.mic .fill{transition:none}}
+</style>
+</head>
+<body>
+<main>
+  <h1>مايك روبلوكس</h1>
+
+  <section id="join" class="hidden" style="width:100%;display:flex;flex-direction:column;gap:14px">
+    <p>اضغط زر المايك في اللعبة وراح يطلع لك كود، اكتبه هنا.</p>
+    <input id="code" maxlength="5" autocomplete="off" placeholder="XXXXX" aria-label="الكود">
+    <button id="go">اربط</button>
+  </section>
+
+  <section id="main" class="hidden" style="width:100%;display:flex;flex-direction:column;align-items:center;gap:14px">
+    <div class="status"><span class="dot on"></span><span id="who"></span></div>
+    <button id="start">فعّل المايك في الموقع</button>
+    <div id="meter" class="hidden" style="display:flex;flex-direction:column;align-items:center;gap:10px">
+      <div class="mic off" id="mic"><div class="fill" id="fill"></div></div>
+      <div class="state" id="state">المايك مقفل</div>
+      <p>اضغط زر المايك داخل اللعبة عشان تفتحه أو تقفله. خلّ هالصفحة مفتوحة وانت تلعب.</p>
+    </div>
+    <div class="list hidden" id="near"><b>القريبين منك</b><div id="names"></div></div>
+  </section>
+
+  <p id="msg" role="status"></p>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const RANGE = 50;
+const ICE = [{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}];
+let ws, code, myId, micOn = false, started = false, ac, stream, track, analyser, buf, level = 0, joined = false, retry;
+const peers = new Map();
+const setMsg = t => $('msg').textContent = t || '';
+const sig = (to, data) => ws.send(JSON.stringify({type:'signal', to, data}));
+
+function show(name){ for (const id of ['join','main']) $(id).classList.toggle('hidden', id !== name); }
+
+function connect(){
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+  ws.onopen = () => ws.send(JSON.stringify({type:'join', code}));
+  ws.onmessage = async (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'joined'){
+      joined = true; myId = m.id; micOn = m.micOn; setMsg('');
+      $('who').textContent = 'مربوط بحساب ' + m.name;
+      show('main'); applyState();
+      if (started) ws.send(JSON.stringify({type:'ready', v:true}));
+    } else if (m.type === 'state'){ micOn = m.micOn; applyState(); }
+    else if (m.type === 'near') onNear(m.peers);
+    else if (m.type === 'signal') onSignal(m.from, m.data);
+    else if (m.type === 'error'){ setMsg(m.msg); if (m.fatal){ joined = false; clearTimeout(retry); closeAll(); show('join'); ws.onclose = null; } }
+  };
+  ws.onclose = () => { closeAll(); if (joined){ setMsg('انقطع الاتصال، أحاول أرجع...'); retry = setTimeout(connect, 2000); } };
+}
+
+function applyState(){
+  if (track) track.enabled = micOn;
+  $('mic').classList.toggle('off', !micOn);
+  $('state').textContent = micOn ? 'المايك شغّال، القريبين منك يسمعونك' : 'المايك مقفل';
+}
+
+async function start(){
+  try{
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    await ac.resume();
+    stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+  }catch(err){ setMsg('ما انسمح للمايك. افتح إعدادات المتصفح للموقع واسمح له بالمايك، وبعدين جرّب مرة ثانية.'); return; }
+  track = stream.getAudioTracks()[0];
+  analyser = ac.createAnalyser(); analyser.fftSize = 512;
+  ac.createMediaStreamSource(stream).connect(analyser);
+  buf = new Uint8Array(analyser.fftSize);
+  started = true; setMsg('');
+  $('start').classList.add('hidden'); $('meter').classList.remove('hidden');
+  $('near').classList.remove('hidden');
+  applyState();
+  ws.send(JSON.stringify({type:'ready', v:true}));
+}
+
+// مستوى الصوت: يتحدث في الصفحة، ويروح للعبة 10 مرات بالثانية
+setInterval(() => {
+  if (!started) return;
+  let v = 0;
+  if (micOn){
+    analyser.getByteTimeDomainData(buf);
+    let s = 0; for (const b of buf){ const x = (b - 128) / 128; s += x * x; }
+    v = Math.min(1, Math.sqrt(s / buf.length) * 5);
+  }
+  level = level * .5 + v * .5;
+  if (ws.readyState === 1) ws.send(JSON.stringify({type:'level', v:+level.toFixed(3)}));
+  const f = $('fill'); f.style.height = (level * 100) + '%';
+  f.style.background = level > .8 ? 'var(--hot)' : level > .5 ? 'var(--warn)' : 'var(--ok)';
+}, 100);
+
+// ---- WebRTC بين اللاعبين القريبين ----
+function closePeer(id){ const p = peers.get(id); if (!p) return; try{p.pc.close();}catch{} try{p.gain&&p.gain.disconnect();}catch{} if (p.audio) p.audio.srcObject = null; peers.delete(id); }
+function closeAll(){ for (const id of [...peers.keys()]) closePeer(id); }
+
+async function makePeer(id, init){
+  const pc = new RTCPeerConnection({iceServers: ICE});
+  const p = {pc, gain:null, g:0, pend:[], last:Date.now()};
+  peers.set(id, p);
+  pc.onicecandidate = e => { if (e.candidate) sig(id, {c:e.candidate}); };
+  pc.ontrack = e => {
+    const st = e.streams[0] || new MediaStream([e.track]);
+    const a = new Audio(); a.srcObject = st; a.muted = true; a.play().catch(()=>{}); // يخلي الصوت يمشي في كروم
+    const g = ac.createGain(); g.gain.value = p.g;
+    ac.createMediaStreamSource(st).connect(g); g.connect(ac.destination);
+    p.gain = g; p.audio = a;
+  };
+  pc.onconnectionstatechange = () => { if (['failed','closed'].includes(pc.connectionState)) closePeer(id); };
+  if (init){
+    pc.addTransceiver(track, {direction:'sendrecv', streams:[stream]});
+    await pc.setLocalDescription(await pc.createOffer());
+    sig(id, {sdp: pc.localDescription});
+  }
+  return p;
+}
+
+async function onSignal(from, d){
+  if (!started) return;
+  let p = peers.get(from);
+  if (d.sdp && d.sdp.type === 'offer'){
+    if (p && p.pc.remoteDescription){ closePeer(from); p = null; }
+    if (!p) p = await makePeer(from, false);
+    await p.pc.setRemoteDescription(d.sdp);
+    const t = p.pc.getTransceivers()[0]; t.direction = 'sendrecv'; await t.sender.replaceTrack(track);
+    await p.pc.setLocalDescription(await p.pc.createAnswer());
+    sig(from, {sdp: p.pc.localDescription});
+    for (const c of p.pend.splice(0)) p.pc.addIceCandidate(c).catch(()=>{});
+  } else if (d.sdp && p){
+    await p.pc.setRemoteDescription(d.sdp);
+    for (const c of p.pend.splice(0)) p.pc.addIceCandidate(c).catch(()=>{});
+  } else if (d.c){
+    if (!p) p = await makePeer(from, false);
+    if (p.pc.remoteDescription) p.pc.addIceCandidate(d.c).catch(()=>{}); else p.pend.push(d.c);
+  }
+}
+
+function onNear(list){
+  if (!started) return;
+  const seen = new Set();
+  for (const q of list){
+    seen.add(q.id);
+    let p = peers.get(q.id);
+    if (!p && Number(myId) < Number(q.id)) makePeer(q.id, true);  // الأصغر في الرقم يبدأ الاتصال
+    p = peers.get(q.id);
+    if (p){
+      p.last = Date.now();
+      p.g = q.dist >= RANGE ? 0 : Math.pow(1 - q.dist / RANGE, 1.3);
+      if (p.gain) p.gain.gain.setTargetAtTime(p.g, ac.currentTime, .15);
+    }
+  }
+  for (const [id, p] of peers){
+    if (!seen.has(id)){ p.g = 0; if (p.gain) p.gain.gain.setTargetAtTime(0, ac.currentTime, .1); if (Date.now() - p.last > 4000) closePeer(id); }
+  }
+  const near = list.filter(q => q.dist < RANGE);
+  $('names').innerHTML = near.length ? '' : '<span>ما فيه أحد قريب</span>';
+  for (const q of near){ const s = document.createElement('span'); s.textContent = q.name; $('names').appendChild(s); }
+}
+
+$('start').onclick = start;
+$('go').onclick = () => { code = $('code').value.trim().toUpperCase(); if (code.length < 4) return setMsg('اكتب الكود كامل.'); setMsg(''); connect(); };
+code = (new URLSearchParams(location.search).get('c') || '').toUpperCase();
+if (code){ show('main'); setMsg('أربطك...'); connect(); } else show('join');
+</script>
+</body>
+</html>
